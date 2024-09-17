@@ -1,0 +1,599 @@
+#![cfg_attr(not(feature = "std"), no_std, no_main)]
+
+use ink::prelude::vec::Vec;
+use ink::storage::traits::StorageLayout;
+use ink::env::DefaultEnvironment;
+type AccountId = <DefaultEnvironment as ink::env::Environment>::AccountId;
+use ink::storage::Mapping;
+use parity_scale_codec::{Encode, Decode};
+#[cfg(feature = "std")]
+use scale_info::TypeInfo;
+
+#[ink::contract]
+mod staking_exchange {
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
+    #[cfg_attr(feature = "std", derive(StorageLayout, scale_info::TypeInfo))]
+    pub struct InterestRateChange {
+        pub rate: u64,
+        pub start_time: u64,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
+    #[cfg_attr(feature = "std", derive(StorageLayout, scale_info::TypeInfo))]
+    pub struct StakeInfo {
+        pub amount: u64,
+        pub start_time: u64,
+        pub interest_accrued: u64,
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
+    #[cfg_attr(feature = "std", derive(StorageLayout, scale_info::TypeInfo))]
+    pub struct UnstakeRequest {
+        pub amount: u64,
+        pub request_time: u64,
+        pub processed: bool,
+    }
+
+    #[ink(event)]
+    pub struct Unstaked {
+  GNU nano 6.2                                                                lib.rs
+        #[ink(topic)]
+        pub user: AccountId,
+        pub principal: u64,
+        pub interest: u64,
+        pub timestamp: u64,
+    }
+
+
+    #[ink(storage)]
+    pub struct StakingExchange {
+        pub interest_rate_history: Vec<InterestRateChange>,
+        user_stakes: Mapping<AccountId, Vec<StakeInfo>>,
+        pub unstake_requests: Mapping<AccountId, Vec<UnstakeRequest>>,
+        pub cooling_period: u64,
+        pub fee_percentage: u64,
+        treasury: AccountId,
+    }
+
+    impl StakingExchange {
+        #[ink(constructor)]
+        pub fn new(treasury: AccountId, cooling_period: u64, fee_percentage: u64) -> Self {
+            let interest_rate_change = InterestRateChange {
+                rate: 50000000000000000, // 5% interest rate
+                start_time: Self::env().block_timestamp(),
+            };
+
+            let mut interest_rate_history = Vec::new();
+            interest_rate_history.push(interest_rate_change);
+
+            Self {
+                interest_rate_history,
+                user_stakes: Default::default(),
+                unstake_requests: Default::default(),
+                cooling_period,
+                fee_percentage,
+                treasury,
+            }
+        }
+
+
+        #[ink(message, payable)]
+        pub fn stake(&mut self) {
+            let caller = self.env().caller();
+            let amount: u64 = self.env().transferred_value().try_into().unwrap();
+            assert!(amount > 0, "Cannot stake 0");
+
+            let mut stakes = self.user_stakes.get(&caller).unwrap_or(Vec::new());
+            stakes.push(StakeInfo {
+                amount,
+                start_time: self.env().block_timestamp(),
+                interest_accrued: 0,
+            });
+            self.user_stakes.insert(caller, &stakes);
+
+            self.env().emit_event(Staked {
+                user: caller,
+                amount,
+                timestamp: self.env().block_timestamp(),
+            });
+        }
+
+        #[ink(message)]
+        pub fn request_unstake(&mut self, amount: u64) {
+            let caller = self.env().caller();
+            let total_staked = self.get_total_staked(caller);
+            assert!(amount <= total_staked, "Insufficient staked amount");
+
+            let mut unstake_requests = self.unstake_requests.get(&caller).unwrap_or(Vec::new());
+            unstake_requests.push(UnstakeRequest {
+                amount,
+                request_time: self.env().block_timestamp(),
+                processed: false,
+            });
+            self.unstake_requests.insert(caller, &unstake_requests);
+
+            let unstake_len = unstake_requests.len() as u64;
+            let request_id = unstake_len.checked_sub(1).expect("Underflow in request ID subtraction");
+
+            self.env().emit_event(UnstakeRequested {
+            user: caller,
+            amount,
+            request_id: request_id,
+            timestamp: self.env().block_timestamp(),
+         });
+
+        }
+
+        #[ink(message)]
+
+pub fn complete_unstake(&mut self, request_index: u64) {
+    let caller = self.env().caller();
+    let mut unstake_requests = self.unstake_requests.get(&caller).unwrap_or(Vec::new());
+
+    // Ensure the request index is valid
+    assert!((request_index as usize) < unstake_requests.len(), "Invalid request index");
+
+    let request = &mut unstake_requests[request_index as usize];
+
+    // Ensure the unstake request is not processed
+    assert!(!request.processed, "Request already processed");
+
+    // Ensure the cooling period has passed
+    let safe_timestamp = request.request_time.checked_add(self.cooling_period)
+    .expect("Overflow in block timestamp addition");
+    assert!(self.env().block_timestamp() >= safe_timestamp, "Cooling period not yet passed");
+
+
+    let amount = request.amount;
+
+    // Check the total staked amount for the user
+    let total_staked = self.get_total_staked(caller);
+    assert!(total_staked >= amount, "Insufficient staked amount");
+
+    // Process the unstake (calculating principal and interest)
+    let (total_principal, total_interest) = self.process_unstake(caller, amount);
+
+    // Calculate the fee (based on the interest) and final payout
+    let scaled_fee = 1e18 as u64;
+    let treasury_fee = total_interest
+        .checked_mul(self.fee_percentage)
+        .expect("Overflow in treasury fee multiplication")
+        .checked_div(scaled_fee)
+        .expect("Division error in treasury fee");
+  // Assuming fee_percentage is in similar scale
+    let interest_after_fee = total_interest
+        .checked_sub(treasury_fee)
+        .expect("Underflow in interest fee calculation");
+
+
+    let total_amount = total_principal
+        .checked_add(interest_after_fee)
+        .expect("Overflow in total amount calculation");
+
+
+    // Ensure the contract has enough balance to cover the unstake
+    let safe_total = total_amount
+        .checked_add(treasury_fee)
+        .expect("Overflow in total balance calculation");
+    assert!(self.env().balance() >= safe_total as u128, "Contract does not have enough balance");
+
+
+    // Transfer the treasury fee to the treasury account
+    self.env().transfer(self.treasury, treasury_fee as u128)
+        .expect("Treasury transfer failed");
+
+    // Transfer the remaining amount (principal + interest after fee) to the user
+    self.env().transfer(caller, total_amount as u128)
+        .expect("Transfer to user failed");
+
+    // Emit the Unstaked event
+    self.env().emit_event(Unstaked {
+        user: caller,
+        principal: total_principal,
+        interest: total_interest,
+        timestamp: self.env().block_timestamp(),
+    });
+
+     // Mark the request as processed
+     request.processed = true;
+
+      // Update the unstake_requests mapping
+       self.unstake_requests.insert(caller, &unstake_requests);
+    }
+
+   fn process_unstake(&mut self, user: AccountId, amount: u64) -> (u64, u64) {
+        let mut remaining_amount = amount;
+        let mut total_principal: u64 = 0;
+        let mut total_interest: u64 = 0;
+
+        let mut stakes = self.user_stakes.get(&user).unwrap_or(Vec::new());
+
+        for stake_info in stakes.iter_mut() {
+            let stake_amount = stake_info.amount;
+            if stake_amount > 0 {
+                let accrued_interest = self.calculate_interest(stake_info);
+
+                if stake_amount >= remaining_amount {
+                    let interest_for_unstaked = accrued_interest.checked_mul(remaining_amount)
+                        .expect("Overflow detected")
+                        .checked_div(stake_amount)
+                        .expect("Division error");
+
+                    total_interest = total_interest.checked_add(interest_for_unstaked)
+                        .expect("Overflow detected");
+                    total_principal = total_principal.checked_add(remaining_amount)
+                        .expect("Overflow detected");
+
+                    stake_info.amount = stake_info.amount.checked_sub(remaining_amount)
+                        .expect("Underflow detected");
+
+
+                    if stake_info.amount == 0 {
+                        stake_info.interest_accrued = 0;
+                    } else {
+                        stake_info.interest_accrued = stake_info.interest_accrued.checked_add(accrued_interest)
+                        .expect("Overflow detected")
+                        .checked_sub(interest_for_unstaked)
+                        .expect("Underflow detected");
+                        stake_info.start_time = self.env().block_timestamp();
+                    }
+
+                   // remaining_amount = 0;
+                    break;
+                } else {
+                    total_interest = total_interest.checked_add(accrued_interest)
+                    .expect("Overflow detected");
+                    total_principal = total_principal.checked_add(stake_amount)
+                    .expect("Overflow detected");
+
+                remaining_amount = remaining_amount.checked_sub(stake_amount)
+                    .expect("Underflow detected");
+
+
+                    stake_info.amount = 0;
+                    stake_info.interest_accrued = 0;
+                }
+            }
+        }
+
+        self.user_stakes.insert(user, &stakes);
+        (total_principal, total_interest)
+    }
+
+    fn calculate_interest(&self, stake_info: &StakeInfo) -> u64 {
+        let mut total_interest: u64 = 0;
+        let mut last_time = stake_info.start_time;
+        let amount = stake_info.amount;
+        let history_length = self.interest_rate_history.len();
+
+        for i in 1..history_length {
+            let rate_change = &self.interest_rate_history[i];
+            if rate_change.start_time > last_time {
+                let time_period = rate_change.start_time.checked_sub(last_time)
+                .expect("Underflow in time period calculation");
+
+                #[allow(clippy::arithmetic_side_effects)]
+                let interest_for_period = amount
+                        .checked_mul(self.interest_rate_history[i - 1].rate)
+                        .expect("Overflow in multiplication of amount and rate")
+                        .checked_mul(time_period)
+                        .expect("Overflow in multiplication of result and time period")
+                        .checked_div(365 * 24 * 60 * 60 * 1_000_000_000)
+                        .expect("Division error in calculating interest for period");
+
+
+                total_interest = total_interest
+                        .checked_add(interest_for_period)
+                        .expect("Overflow in total interest calculation");
+
+
+                last_time = rate_change.start_time;
+            }
+        }
+
+        if last_time < self.env().block_timestamp() {
+            let time_period = self.env().block_timestamp().checked_sub(last_time)
+                        .expect("Underflow in block timestamp subtraction");
+
+            let rate = self.interest_rate_history.get(history_length.checked_sub(1)
+                        .expect("History length underflow"))
+                        .expect("Index out of bounds in interest rate history")
+                        .rate;
+
+
+
+            let interest_for_period = (amount as u64)
+                .checked_mul(rate)
+                .expect("Overflow in multiplication")
+                .checked_mul(time_period as u64)
+                .expect("Overflow in time period multiplication")
+                .checked_div(365 * 24 * 60 * 60 * 1_000_000_000)
+                .expect("Division error");
+
+            total_interest = total_interest
+                .checked_add(interest_for_period)
+                .expect("Overflow in interest calculation");
+        }
+
+        total_interest
+    }
+        #[ink(message)]
+
+pub fn claim_reward(&mut self) {
+    let caller = self.env().caller();
+    let mut stakes = self.user_stakes.get(&caller).unwrap_or(Vec::new());
+
+    // Calculate total accrued interest for all stakes
+    let mut total_accrued_interest: u64 = 0;
+
+    for stake_info in stakes.iter_mut() {
+        let accrued_interest = self.calculate_interest(stake_info);
+        stake_info.interest_accrued = stake_info.interest_accrued
+                .checked_add(accrued_interest)
+                .expect("Overflow in interest accrued calculation");
+
+        total_accrued_interest = total_accrued_interest
+                .checked_add(accrued_interest)
+                .expect("Overflow in total accrued interest calculation");
+
+        // Update the stake's start time to the current time
+        stake_info.start_time = self.env().block_timestamp();
+    }
+
+    // Ensure there is enough balance in the contract to pay the rewards
+    assert!(
+        self.env().balance() >= total_accrued_interest.into(),
+        "Contract does not have enough balance to pay rewards"
+    );
+
+    // Transfer the rewards (interest accrued) to the user
+    self.env().transfer(caller, total_accrued_interest.into())
+        .expect("Transfer of rewards failed");
+
+    // Save the updated stakes back to storage
+    self.user_stakes.insert(caller, &stakes);
+}
+
+   #[ink(message)]
+   pub fn get_fee_percentage(&self) -> u64 {
+        self.fee_percentage
+   }
+
+
+   #[ink(message)]
+   pub fn get_cooling_period(&self) -> u64 {
+        self.cooling_period
+   }
+
+   #[ink(message)]
+   pub fn get_current_interest_rate(&self) -> u64 {
+        // Return the most recent interest rate
+        self.interest_rate_history
+                .last()
+                .map_or(0, |rate_change| rate_change.rate) // Returns 0 if the history is empty
+   }
+
+   #[ink(message)]
+   pub fn set_fee_percentage(&mut self, new_fee_percentage: u64) {
+        // Ensure that only the contract owner (treasury) can update the fee percentage
+        assert_eq!(self.env().caller(), self.treasury, "Only the treasury can update the fee percentage");
+
+        // Update the fee percentage
+        self.fee_percentage = new_fee_percentage;
+   }
+
+   #[ink(message)]
+   pub fn set_cooling_period(&mut self, new_cooling_period: u64) {
+        // Ensure that only the contract owner (treasury) can update the cooling period
+        assert_eq!(self.env().caller(), self.treasury, "Only the treasury can update the cooling period");
+
+        // Update the cooling period
+        self.cooling_period = new_cooling_period;
+   }
+
+   #[ink(message)]
+   pub fn set_interest_rate(&mut self, new_rate: u64) {
+        // Ensure that only the contract owner (treasury) can update the interest rate
+        assert_eq!(self.env().caller(), self.treasury, "Only the treasury can update the interest rate");
+  GNU nano 6.2                                                                lib.rs
+
+        // Add a new entry to the interest rate history
+        let new_rate_change = InterestRateChange {
+                rate: new_rate,
+                start_time: self.env().block_timestamp(),
+        };
+        self.interest_rate_history.push(new_rate_change);
+    }
+
+    #[ink(message)]
+   pub fn get_total_staked_with_interest_for_caller(&self) -> (u64, u64) {
+        // Get the caller's address (AccountId)
+        let caller = self.env().caller();
+
+        // Fetch all the stakes for the caller
+        let stakes = self.user_stakes.get(&caller).unwrap_or(Vec::new());
+
+        // Initialize variables for total principal and total interest
+        let mut total_principal: u64 = 0;
+        let mut total_interest: u64 = 0;
+
+        // Iterate over each stake and calculate the total staked and accrued interest
+        for stake_info in stakes.iter() {
+                total_principal = total_principal.checked_add(stake_info.amount)
+                .expect("Overflow in adding total staked");
+
+                let accrued_interest = self.calculate_interest(stake_info);
+                total_interest = total_interest.checked_add(accrued_interest)
+                .expect("Overflow in adding accrued interest");
+        }
+
+        // Return the total staked amount and the accrued interest
+        (total_principal, total_interest)
+   }
+
+
+        #[ink(message)]
+        pub fn get_total_staked(&self, user: AccountId) -> u64 {
+            let stakes = self.user_stakes.get(&user).unwrap_or(Vec::new());
+            stakes.iter().map(|stake| stake.amount).sum()
+  GNU nano 6.2                                                                lib.rs
+        }
+    }
+
+    #[ink(event)]
+    pub struct Staked {
+        #[ink(topic)]
+        pub user: AccountId,
+        pub amount: u64,
+        pub timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct UnstakeRequested {
+        #[ink(topic)]
+        pub user: AccountId,
+        pub amount: u64,
+        pub request_id: u64,
+        pub timestamp: u64,
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::staking_exchange::{StakingExchange, Staked, UnstakeRequested};
+
+    #[ink::test]
+    fn test_initialize_contract() {
+        // Initialize the contract
+        let mut contract = StakingExchange::new(
+            AccountId::from([0x1; 32]),
+            10, // cooling period
+            10000000000000000, // fee percentage (1%)
+        );
+
+        // Check initial values
+        assert_eq!(contract.cooling_period, 10);
+        assert_eq!(contract.fee_percentage, 10000000000000000);
+        assert_eq!(contract.interest_rate_history.len(), 1);
+        assert_eq!(contract.interest_rate_history[0].rate, 50000000000000000);
+    }
+
+    #[ink::test]
+    fn test_stake() {
+        let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+        let mut contract = StakingExchange::new(
+                accounts.alice,
+                10, // cooling period
+                10000000000000000, // fee percentage (1%)
+        );
+
+        // Mock the environment to send a transferred value
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(1000);
+
+        // Alice stakes 1000 units
+        contract.stake();
+
+        // Verify that the stake was added
+        let total_staked = contract.get_total_staked(accounts.alice);
+        assert_eq!(total_staked, 1000);
+
+        // Verify that the `Staked` event was emitted
+        let emitted_events = ink::env::test::recorded_events().collect::<Vec<_>>();
+        assert_eq!(emitted_events.len(), 1);
+
+        // Extract the event data
+        let emitted_event = &emitted_events[0];
+        let event_data = emitted_event.data;
+        let decoded_event: Staked = <Staked as parity_scale_codec::Decode>::decode(&mut &event_data[..])
+        .expect("Failed to decode event");
+
+        // Check the decoded event data
+        assert_eq!(decoded_event.user, accounts.alice);
+        assert_eq!(decoded_event.amount, 1000);
+        }
+
+
+    #[ink::test]
+fn test_request_unstake() {
+    let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+    let mut contract = StakingExchange::new(
+        accounts.alice,
+        10, // cooling period
+        10000000000000000, // fee percentage (1%)
+    );
+
+    // Mock the environment to send a transferred value
+    ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(1000);
+
+    // Alice stakes 1000 units
+    contract.stake();
+
+    // Alice requests to unstake 500 units
+    contract.request_unstake(500);
+
+    // Verify that an unstake request was created
+    let unstake_requests = contract.unstake_requests.get(&accounts.alice).unwrap();
+    assert_eq!(unstake_requests.len(), 1);
+    assert_eq!(unstake_requests[0].amount, 500);
+    assert_eq!(unstake_requests[0].processed, false);
+
+    // Verify that the `UnstakeRequested` event was emitted
+    let emitted_events = ink::env::test::recorded_events().collect::<Vec<_>>();
+    assert_eq!(emitted_events.len(), 2); // Staked + UnstakeRequested
+
+    // Access the second emitted event (UnstakeRequested event)
+    let emitted_event = &emitted_events[1];
+
+    // Clone the data explicitly before decoding
+    let event_data: &[u8] = emitted_event.data.as_slice(); // Convert to slice directly
+
+    // Manually decode the event data using UnstakeRequested
+    let decoded_event: UnstakeRequested = <UnstakeRequested as parity_scale_codec::Decode>::decode(&mut &event_data[..])
+        .expect("Failed to decode event");
+
+    // Check the decoded event data
+    assert_eq!(decoded_event.user, accounts.alice);
+    assert_eq!(decoded_event.amount, 500);
+}
+
+
+    #[ink::test]
+    fn test_complete_unstake() {
+        let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+        let mut contract = StakingExchange::new(
+            accounts.alice,
+            10, // cooling period
+            10000000000000000, // fee percentage (1%)
+        );
+
+        // Mock the environment to send a transferred value
+        ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(1000);
+
+        // Alice stakes 1000 units
+        contract.stake();
+
+        // Alice requests to unstake 500 units
+        contract.request_unstake(500);
+
+        // Simulate the passing of the cooling period
+        ink::env::test::advance_block::<ink::env::DefaultEnvironment>();
+
+        // Alice completes the unstake
+        contract.complete_unstake(0);
+
+        // Verify that the unstake request was processed
+        let unstake_requests = contract.unstake_requests.get(&accounts.alice).unwrap();
+        assert!(unstake_requests[0].processed);
+
+        // Verify that the stake amount was reduced
+        let total_staked = contract.get_total_staked(accounts.alice);
+        assert_eq!(total_staked, 500);
+    }
+}
+
+
+
